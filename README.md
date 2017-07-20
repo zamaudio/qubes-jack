@@ -7,7 +7,7 @@ Native JACK support for Qubes OS
 Basic idea
 ==========
 
-
+```
 +--------------+
 |              +-- Physical Output Ports
 |  Soundcard   |
@@ -27,7 +27,8 @@ Basic idea
 |     JACK---VCHAN-+----+--JACK(dummy) |
 |    SERVER    |        |        AppVM2|
 +--------------+        +--------------+
-        
+```
+
 The proposed idea is that a separate SoundVM is hosted by the backend vmm,
 which has raw access to the sound card and runs the kernel driver for the card natively.
 JACK server would run on top of this and a qubes-vchan-jack-passthru application would
