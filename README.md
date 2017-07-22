@@ -40,3 +40,8 @@ also run its own instance of a client jack application that connects
 to the vchan ports as a client, relaying the sound data via vchan and exposing native JACK ports.
 The native JACK ports within the AppVMs can be used as regular system hardware ports,
 transparently relaying the sound data to the underlying JACK server on the SoundVM.
+
+Demo
+====
+
+![Demo](doc/demo.png)
