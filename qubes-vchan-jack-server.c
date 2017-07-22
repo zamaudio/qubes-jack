@@ -70,43 +70,6 @@ struct userdata {
 	bool pause;
 };
 
-static int write_to_vchan(libvchan_t *ctrl, char *buf, int size)
-{
-	static int all = 0, waited = 0, nonwaited = 0, full = 0;
-	ssize_t l;
-	fd_set rfds;
-	struct timeval tv = { 0, 0 };
-	int ret, fd = libvchan_fd_for_select(ctrl);
-	FD_ZERO(&rfds);
-	FD_SET(fd, &rfds);
-	all++;
-	ret = select(fd + 1, &rfds, NULL, NULL, &tv);
-	if (ret == -1) {
-		fprintf(stderr, "Failed to select() in vchan\n");
-		return -1;
-	}
-	if (ret) {
-		if (libvchan_wait(ctrl) < 0) {
-			fprintf(stderr, "Failed libvchan_wait\n");
-			return -1;
-		}
-		waited++;
-	} else
-		nonwaited++;
-	if (libvchan_buffer_space(ctrl)) {
-		l = libvchan_write(ctrl, buf, size);
-	} else {
-		l = -1;
-		errno = EAGAIN;
-		full++;
-	}
-	if ((all % 8000) == 0) {
-		fprintf(stderr, "write_to_vchan: all=%d waited=%d nonwaited=%d full=%d\n",
-			all, waited, nonwaited, full);
-	}
-	return l;
-}
-
 static void qubes_jack_connect_ports(struct userdata *u)
 {
 	unsigned int c;
@@ -149,10 +112,10 @@ end:
 	jack_free(phys_in_ports);
 }
 
-static void get_jack_rec_port_count(struct userdata *u)
+static void get_jack_play_port_count(struct userdata *u)
 {
 	unsigned int c;
-	u->record_count = 0;
+	u->play_count = 0;
 
 	const char **phys_in_ports = jack_get_ports(u->jack_client,
 							  NULL, NULL,
@@ -161,18 +124,18 @@ static void get_jack_rec_port_count(struct userdata *u)
 	if (*phys_in_ports == NULL)
 		goto end;
 
-	// Count capture ports
+	// Count playback ports
 	for (c = 0; c < MAX_CH && phys_in_ports[c] != NULL; c++) {}
-	u->record_count = c;
+	u->play_count = c;
 
 end:
 	jack_free(phys_in_ports);
 }
 
-static void get_jack_play_port_count(struct userdata *u)
+static void get_jack_rec_port_count(struct userdata *u)
 {
 	unsigned int c;
-	u->play_count = 0;
+	u->record_count = 0;
 
 	const char **phys_out_ports = jack_get_ports(u->jack_client,
 							  NULL, NULL,
@@ -181,9 +144,9 @@ static void get_jack_play_port_count(struct userdata *u)
 	if (*phys_out_ports == NULL)
 		goto end;
 
-	// Count playback ports
+	// Count capture ports
 	for (c = 0; c < MAX_CH && phys_out_ports[c] != NULL; c++) {}
-	u->play_count = c;
+	u->record_count = c;
 
 end:
 	jack_free(phys_out_ports);
@@ -271,8 +234,16 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	unsigned int c;
 	long f;
 	long j;
-	void *vchanbuffer;
+	//fprintf(stderr, "Process...");
 
+	int rec_ready = libvchan_is_open(u->rec);
+	int play_ready = libvchan_is_open(u->play);
+
+	if (rec_ready == 1 && play_ready == 1) {
+		u->pause = false;
+	} else if (rec_ready != 1 || play_ready != 1) {
+		u->pause = true;
+	}
 	float *bufs_out[u->play_count];
 	float *bufs_in[u->record_count];
 
@@ -310,33 +281,47 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 		}
 	} else {
 		// unpaused, play audio
-
+		//fprintf(stderr, "doing something...");
+		j = u->play_count * nframes * sizeof(float);
 		// read a jack sized block from vchan playback buffer
-		libvchan_read(u->play, vchanbuffer, u->play_count * nframes * sizeof(float));
+		if (libvchan_data_ready(u->play) >= j) {
+			libvchan_read(u->play, u->tmpbuffer, j);
 
-		// write jack sized block to jack (play)
-		j = 0;
-		for (c = 0; c < u->play_count; c++) {
-			float *buffer_out = bufs_out[c];
-			for (f = 0; f < nframes; f++) {
-				// read interleaved buffer
-				buffer_out[c + f * u->play_count] = read_nth_float(vchanbuffer, j++);
+			// write jack sized block to jack (play)
+			for (c = 0; c < u->play_count; c++) {
+				float *buffer_out = bufs_out[c];
+				for (f = 0; f < nframes; f++) {
+					// read interleaved buffer
+					buffer_out[f] = read_nth_float(u->tmpbuffer, c + f * u->play_count);
+				}
+			}
+		} else {
+			// play silence
+			for (c = 0; c < u->play_count; c++) {
+				float *buffer_out = bufs_out[c];
+				for (f = 0; f < nframes; f++) {
+					buffer_out[f] = 0.f;
+				}
 			}
 		}
-
 		// unpaused, record audio
 
 		// capture jack sized buffer and write interleaved floats to tmpbuffer
-		j = 0;
 		for (c = 0; c < u->record_count; c++) {
 			float *buffer_in = bufs_in[c];
 			for (f = 0; f < nframes; f++) {
 				// write interleaved buffer
-				write_nth_float(u->tmpbuffer, j++, buffer_in[c + f * u->record_count]);
+				write_nth_float(u->tmpbuffer, c + f * u->record_count, buffer_in[f]);
 			}
 		}
 		// commit tmpbuffer to vchan
-		write_to_vchan(u->rec, u->tmpbuffer, u->record_count * nframes * sizeof(float));
+		//fprintf(stderr, "Buffering...");
+		j = u->record_count * nframes * sizeof(float);
+		if (libvchan_buffer_space(u->rec) >= j) {
+			//fprintf(stderr, "Writing...");
+			libvchan_write(u->rec, u->tmpbuffer, j);
+			//fprintf(stderr, "done\n");
+		}
 	}
 	return 0;
 }
@@ -383,16 +368,14 @@ static int qubes_jack_init(struct userdata *u)
 	return 0;
 }
 
-static int vchan_conn(struct userdata *u)
+static int vchan_conn(struct userdata *u, int domid)
 {
-    /* FIXME: 0 is remote domain ID */
-	u->play = libvchan_server_init(0, QUBES_JACK_PLAYBACK_VCHAN_PORT, 128, 2048);
+	u->play = libvchan_server_init(domid, QUBES_JACK_PLAYBACK_VCHAN_PORT, 8192, 128);
 	if (!u->play) {
 		fprintf(stderr, "libvchan_server_init play failed\n");
 		return -1;
 	}
-    /* FIXME: 0 is remote domain ID */
-	u->rec = libvchan_server_init(0, QUBES_JACK_RECORD_VCHAN_PORT, 2048, 128);
+	u->rec = libvchan_server_init(domid, QUBES_JACK_RECORD_VCHAN_PORT, 128, 8192);
 	if (!u->rec) {
 		fprintf(stderr, "libvchan_server_init rec failed\n");
 		return -1;
@@ -409,7 +392,7 @@ void vchan_done(struct userdata *u)
 		libvchan_close(u->rec);
 }
 
-int main()
+int main(int argc, char **argv)
 {
 	unsigned int c;
 	struct userdata u;
@@ -417,15 +400,22 @@ int main()
 	u.pause = true;
 	u.ports_ready = false;
 
-	if (vchan_conn(&u))
+	fprintf(stderr, "Open vchan...");
+	if (vchan_conn(&u), atoi(argv[1]))
 		return 1;
+	fprintf(stderr, "done\n");
 
+	fprintf(stderr, "Open JACK...");
 	if (qubes_jack_init(&u))
 		return 1;
+	fprintf(stderr, "done\n");
 	
+	fprintf(stderr, "Get config...");
 	get_jack_play_port_count(&u);
 	get_jack_rec_port_count(&u);
+	fprintf(stderr, "done\n");
 
+	fprintf(stderr, "Connect ports...");
 	for (c = 0; c < u.play_count; c++) {
 		char portname[20];
 		snprintf(portname, 20, "out_%d", c);
@@ -447,9 +437,12 @@ int main()
 	qubes_jack_connect_ports(&u);
 	u.ports_ready = true;
 	u.pause = false;
+	fprintf(stderr, "done\n");
 
 	// Wait until killed
+	fprintf(stderr, "Wait for kill...");
 	sleep(-1);
+	fprintf(stderr, "done\n");
 
 	// shutdown
 	u.pause = true;

@@ -8,8 +8,10 @@ JACKCFLAGS=$(shell pkg-config --cflags jack)
 LIBS=$(JACKLIBS) $(VCHANLIBS) -lm
 CFLAGS+=$(VCHANCFLAGS) $(JACKCFLAGS)
 
-all: qubes-vchan-jack-passthru
-qubes-vchan-jack-passthru:
-	$(CC) $(CFLAGS) qubes-vchan-jack-passthru.c $(LIBS) -o qubes-vchan-jack-passthru
+all: qubes-vchan-jack-server qubes-vchan-jack-client
+qubes-vchan-jack-server:
+	$(CC) $(CFLAGS) qubes-vchan-jack-server.c $(LIBS) -o qubes-vchan-jack-server
+qubes-vchan-jack-client:
+	$(CC) $(CFLAGS) qubes-vchan-jack-client.c $(LIBS) -o qubes-vchan-jack-client
 clean:
-	rm -f qubes-vchan-jack-passthru *.o *~
+	rm -f qubes-vchan-jack-server qubes-vchan-jack-client *.o *~
