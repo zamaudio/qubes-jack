@@ -400,8 +400,12 @@ int main(int argc, char **argv)
 	u.pause = true;
 	u.ports_ready = false;
 
+	if (argc < 2) {
+		fprintf(stderr, "Error: need remote domid");
+		return 1;
+	}
 	fprintf(stderr, "Open vchan...");
-	if (vchan_conn(&u), atoi(argv[1]))
+	if (vchan_conn(&u, atoi(argv[1])))
 		return 1;
 	fprintf(stderr, "done\n");
 
