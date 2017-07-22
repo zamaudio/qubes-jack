@@ -187,27 +187,33 @@ static int qubes_jack_graph_order_callback(void *arg)
 	return 0;
 }
 
+static void send_config_data(struct userdata *u)
+{
+	uint8_t response[QUBES_JACK_CONFIG_QUERY_SIZE];
+
+	// Prepare the response packet
+	response[0] = QUBES_JACK_CONFIG_QUERY_START;
+	response[1] = u->play_count;
+	response[2] = u->record_count;
+	response[3] = log2_(u->jack_buffer_size);
+	write_nth_u32(response, 1, u->jack_sample_rate);
+	write_nth_u32(response, 2, u->jack_xruns);
+	response[12] = QUBES_JACK_CONFIG_QUERY_END;
+
+	// Write response to vchan
+	if (libvchan_buffer_space(u->control) >= QUBES_JACK_CONFIG_QUERY_SIZE) {
+		libvchan_write(u->control, response, QUBES_JACK_CONFIG_QUERY_SIZE);
+	}
+}
+
 static void process_vchan_client_query(struct userdata *u)
 {
 	uint8_t cmd;
-	uint8_t response[QUBES_JACK_CONFIG_QUERY_SIZE];
 
 	if (libvchan_data_ready(u->control) >= 1) {
 		libvchan_read(u->control, &cmd, 1);
 		if (cmd == QUBES_JACK_CONFIG_QUERY_CMD) {
-			// Prepare the response packet
-			response[0] = QUBES_JACK_CONFIG_QUERY_START;
-			response[1] = u->play_count;
-			response[2] = u->record_count;
-			response[3] = log2_(u->jack_buffer_size);
-			write_nth_u32(response, 1, u->jack_sample_rate);
-			write_nth_u32(response, 2, u->jack_xruns);
-			response[12] = QUBES_JACK_CONFIG_QUERY_END;
-
-			// Write response to vchan
-			if (libvchan_buffer_space(u->control) >= QUBES_JACK_CONFIG_QUERY_SIZE) {
-				libvchan_write(u->control, response, QUBES_JACK_CONFIG_QUERY_SIZE);
-			}
+			send_config_data(u);
 		}
 	}
 }
@@ -332,7 +338,7 @@ static int qubes_jack_init(struct userdata *u)
 		return -1;
 	}
 
-	const char *jack_client_name = "qubes-vchan-passthru";
+	const char *jack_client_name = "qubes-vchan-server";
 	u->jack_client = jack_client_open(jack_client_name, JackNoStartServer, NULL);
 
 	if (!u->jack_client) {
@@ -360,17 +366,23 @@ static int qubes_jack_init(struct userdata *u)
 
 static int vchan_conn(struct userdata *u, int domid)
 {
-	u->play = libvchan_server_init(domid, QUBES_JACK_PLAYBACK_VCHAN_PORT, 8192, 128);
+	u->play = libvchan_server_init(domid, QUBES_JACK_PLAYBACK_VCHAN_PORT,
+			MAX_CH * sizeof(float) * 1024,
+			MAX_CH * sizeof(float) * 16);
 	if (!u->play) {
 		fprintf(stderr, "libvchan_server_init play failed\n");
 		return -1;
 	}
-	u->rec = libvchan_server_init(domid, QUBES_JACK_RECORD_VCHAN_PORT, 128, 8192);
+	u->rec = libvchan_server_init(domid, QUBES_JACK_RECORD_VCHAN_PORT,
+			MAX_CH * sizeof(float) * 16,
+			MAX_CH * sizeof(float) * 1024);
 	if (!u->rec) {
 		fprintf(stderr, "libvchan_server_init rec failed\n");
 		return -1;
 	}
-	u->control = libvchan_server_init(domid, QUBES_JACK_CONFIG_VCHAN_PORT, 1, 1);
+	u->control = libvchan_server_init(domid, QUBES_JACK_CONFIG_VCHAN_PORT,
+			QUBES_JACK_CONFIG_QUERY_SIZE,
+			QUBES_JACK_CONFIG_QUERY_SIZE);
 	if (!u->control) {
 		fprintf(stderr, "libvchan_server_init control failed\n");
 		return -1;

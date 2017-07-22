@@ -45,9 +45,6 @@
 #include <jack/jack.h>
 #include <jack/statistics.h>
 
-#define MAX_CH 2
-#define MAX_JACK_BUFFER 8192
-
 struct userdata {
 	unsigned int jack_sample_rate;
 	unsigned int jack_buffer_size;
@@ -68,17 +65,8 @@ struct userdata {
 	unsigned int record_count;
 	bool ports_ready;
 	bool pause;
+	bool skip_process;
 };
-
-static void get_jack_rec_port_count(struct userdata *u)
-{
-	u->record_count = 2;
-}
-
-static void get_jack_play_port_count(struct userdata *u)
-{
-	u->play_count = 2;
-}
 
 static void close_jack_ports(struct userdata *u)
 {
@@ -173,6 +161,7 @@ static void reconfigure_jack_client(struct userdata *u, int play, int rec)
 	open_jack_ports(u);
 
 	u->ports_ready = true;
+	u->skip_process = true;
 }
 
 static void process_vchan_server_response(struct userdata *u)
@@ -238,10 +227,14 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	}
 	u->jack_xruns -= t_jack_xruns;
 
+	process_vchan_server_response(u);
+
+	if (u->skip_process) {
+		u->skip_process = false;
+		return 0;
+	}
 	if (!u->ports_ready)
 		return 0;
-
-	process_vchan_server_response(u);
 
 	// get jack output buffers
 	for (i = 0; i < u->play_count; i++)
@@ -392,8 +385,10 @@ void vchan_done(struct userdata *u)
 int main(int argc, char **argv)
 {
 	struct userdata u;
+	uint8_t cmd = QUBES_JACK_CONFIG_QUERY_CMD;
 
 	u.pause = true;
+	u.skip_process = false;
 	u.ports_ready = false;
 
 	if (argc < 2) {
@@ -411,9 +406,12 @@ int main(int argc, char **argv)
 		return 1;
 	fprintf(stderr, "done\n");
 
-	fprintf(stderr, "Get config...");
-	get_jack_play_port_count(&u);
-	get_jack_rec_port_count(&u);
+	fprintf(stderr, "Query for config...");
+	u.record_count = 0;
+	u.play_count = 0;
+	if (libvchan_buffer_space(u.control) >= 1) {
+		libvchan_write(u.control, &cmd, 1);
+	}
 	fprintf(stderr, "done\n");
 
 	fprintf(stderr, "Open JACK ports...");

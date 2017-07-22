@@ -37,7 +37,7 @@
 #define QUBES_JACK_CONFIG_QUERY_END 0xFE
 // End packet
 
-#define MAX_CH 2
+#define MAX_CH 8
 #define MAX_JACK_BUFFER 8192
 
 static int __attribute__((unused)) read_nth_u32(void *buf, long n)
