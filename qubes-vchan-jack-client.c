@@ -80,6 +80,48 @@ static void get_jack_play_port_count(struct userdata *u)
 	u->play_count = 2;
 }
 
+static void close_jack_ports(struct userdata *u)
+{
+	unsigned int c;
+
+	for (c = 0; c < u->record_count; c++) {
+		if (u->output_ports[c]) {
+			jack_port_unregister(u->jack_client, u->output_ports[c]);
+			u->output_ports[c] = NULL;
+		}
+	}
+
+	for (c = 0; c < u->play_count; c++) {
+		if (u->input_ports[c]) {
+			jack_port_unregister(u->jack_client, u->input_ports[c]);
+			u->input_ports[c] = NULL;
+		}
+	}
+}
+
+static void open_jack_ports(struct userdata *u)
+{
+	unsigned int c;
+
+	for (c = 0; c < u->record_count; c++) {
+		char portname[20];
+		snprintf(portname, 20, "record_%d", c + 1);
+		u->output_ports[c] = jack_port_register(u->jack_client,
+					portname,
+					JACK_DEFAULT_AUDIO_TYPE,
+					JackPortIsOutput, 0);
+	}
+
+	for (c = 0; c < u->play_count; c++) {
+		char portname[20];
+		snprintf(portname, 20, "playback_%d", c + 1);
+		u->input_ports[c] = jack_port_register(u->jack_client,
+					portname,
+					JACK_DEFAULT_AUDIO_TYPE,
+					JackPortIsInput, 0);
+	}
+}
+
 static int qubes_jack_xrun_callback(void *arg)
 {
 	struct userdata *u = (struct userdata *)arg;
@@ -119,38 +161,53 @@ static int qubes_jack_graph_order_callback(void *arg)
 	return 0;
 }
 
-static float read_nth_float(void *buf, long n)
+static void reconfigure_jack_client(struct userdata *u, int play, int rec)
 {
-	uint8_t *base = (uint8_t *)buf;
-	union dual {
-		uint32_t u;
-		float f;
-	};
-	union dual v;
-	base += sizeof(float) * n;
-	
-	v.u =	(uint32_t)(base[0] << 24) |
-		(uint32_t)(base[1] << 16) |
-	 	(uint32_t)(base[2] <<  8) |
-		(uint32_t)(base[3] <<  0);
-	return v.f;
+	u->ports_ready = false;
+
+	close_jack_ports(u);
+
+	u->play_count = play;
+	u->record_count = rec;
+
+	open_jack_ports(u);
+
+	u->ports_ready = true;
 }
 
-static void write_nth_float(void *buf, long n, float value)
+static void process_vchan_server_response(struct userdata *u)
 {
-	uint8_t *base = (uint8_t *)buf;
-	union dual {
-		uint32_t u;
-		float f;
-	};
-	union dual v;
-	v.f = value;
-	base += sizeof(float) * n;
+	uint8_t buf[QUBES_JACK_CONFIG_QUERY_SIZE];
+	uint8_t new_play_count = u->play_count;
+	uint8_t new_record_count = u->record_count;
+	uint32_t new_buffer_size = u->jack_buffer_size;
+	uint32_t new_sample_rate = u->jack_sample_rate;
+	uint32_t new_xrun_count = u->jack_xruns;
 
-	base[0] = (v.u >> 24) & 0xff;
-	base[1] = (v.u >> 16) & 0xff;
-	base[2] = (v.u >>  8) & 0xff;
-	base[3] = (v.u >>  0) & 0xff;
+        if (libvchan_data_ready(u->control) >= QUBES_JACK_CONFIG_QUERY_SIZE) {
+                // Read config packet if it's waiting
+                libvchan_read(u->control, buf, QUBES_JACK_CONFIG_QUERY_SIZE);
+
+                // Parse config packet
+                if ((buf[0] == QUBES_JACK_CONFIG_QUERY_START) &&
+                                buf[12] == QUBES_JACK_CONFIG_QUERY_END) {
+                        new_play_count = buf[1];
+                        new_record_count = buf[2];
+                        new_buffer_size = (uint32_t)(1 << buf[3]);
+                        new_sample_rate = read_nth_u32(buf, 1);
+			new_xrun_count = read_nth_u32(buf, 2); 
+		}
+
+		// Check if jack config changed
+		if ((new_play_count != u->play_count) ||
+				(new_record_count != u->record_count) ||
+				(new_buffer_size != u->jack_buffer_size)) {
+			reconfigure_jack_client(u, new_play_count, new_record_count);
+		}
+		// FIXME: Handle jack server changing its sample rate
+		u->jack_xruns = new_xrun_count;
+		new_sample_rate = new_sample_rate;
+	}
 }
 
 static int qubes_jack_process(jack_nframes_t nframes, void *arg)
@@ -184,6 +241,8 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	if (!u->ports_ready)
 		return 0;
 
+	process_vchan_server_response(u);
+
 	// get jack output buffers
 	for (i = 0; i < u->play_count; i++)
 		bufs_in[i] = (float*)jack_port_get_buffer(u->input_ports[i], nframes);
@@ -191,7 +250,7 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	// get jack input buffers
 	for (i = 0; i < u->record_count; i++)
 		bufs_out[i] = (float*)jack_port_get_buffer(u->output_ports[i], nframes);
-	
+
 	if (u->pause) {
 		// paused, play silence on output
 		for (c = 0; c < u->record_count; c++) {
@@ -275,7 +334,7 @@ static int qubes_jack_init(struct userdata *u)
 		qubes_jack_destroy(u);
 		return -1;
 	}
-		
+
 	const char *jack_client_name = "qubes-vchan-client";
 	u->jack_client = jack_client_open(jack_client_name, JackNoStartServer, NULL);
 
@@ -313,6 +372,11 @@ static int vchan_conn(struct userdata *u, int domid)
 		fprintf(stderr, "libvchan_client_init rec failed\n");
 		return -1;
 	}
+	u->control = libvchan_client_init(domid, QUBES_JACK_CONFIG_VCHAN_PORT);
+	if (!u->control) {
+		fprintf(stderr, "libvchan_client_init control failed\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -327,7 +391,6 @@ void vchan_done(struct userdata *u)
 
 int main(int argc, char **argv)
 {
-	unsigned int c;
 	struct userdata u;
 
 	u.pause = true;
@@ -347,30 +410,14 @@ int main(int argc, char **argv)
 	if (qubes_jack_init(&u))
 		return 1;
 	fprintf(stderr, "done\n");
-	
+
 	fprintf(stderr, "Get config...");
 	get_jack_play_port_count(&u);
 	get_jack_rec_port_count(&u);
 	fprintf(stderr, "done\n");
 
 	fprintf(stderr, "Open JACK ports...");
-	for (c = 0; c < u.record_count; c++) {
-		char portname[20];
-		snprintf(portname, 20, "record_%d", c + 1);
-		u.output_ports[c] = jack_port_register(u.jack_client,
-					portname,
-					JACK_DEFAULT_AUDIO_TYPE,
-					JackPortIsOutput, 0);
-	}
-
-	for (c = 0; c < u.play_count; c++) {
-		char portname[20];
-		snprintf(portname, 20, "playback_%d", c + 1);
-		u.input_ports[c] = jack_port_register(u.jack_client,
-					portname,
-					JACK_DEFAULT_AUDIO_TYPE,
-					JackPortIsInput, 0);
-	}
+	open_jack_ports(&u);
 	fprintf(stderr, "done\n");
 
 	u.ports_ready = true;
@@ -383,19 +430,7 @@ int main(int argc, char **argv)
 	u.pause = true;
 	u.ports_ready = false;
 
-	for (c = 0; c < u.record_count; c++) {
-		if (u.output_ports[c]) {
-        		jack_port_unregister (u.jack_client, u.output_ports[c]);
-        		u.output_ports[c] = NULL;
-		}
-	}
-
-	for (c = 0; c < u.play_count; c++) {
-		if (u.input_ports[c]) {
-			jack_port_unregister (u.jack_client, u.input_ports[c]);
-			u.input_ports[c] = NULL;
-		}
-	}
+	close_jack_ports(&u);
 
 	qubes_jack_destroy(&u);
 	vchan_done(&u);

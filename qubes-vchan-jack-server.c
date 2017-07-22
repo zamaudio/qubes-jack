@@ -45,15 +45,11 @@
 #include <jack/jack.h>
 #include <jack/statistics.h>
 
-#define MAX_CH 2
-#define MAX_JACK_BUFFER 8192
-
 struct userdata {
 	unsigned int jack_sample_rate;
 	unsigned int jack_buffer_size;
 	unsigned int jack_xruns;
 	unsigned int jack_latency;
-	unsigned int bytes_per_frame;
 
 	jack_client_t *jack_client;
 	jack_port_t *input_ports[MAX_CH];
@@ -64,8 +60,8 @@ struct userdata {
 	libvchan_t *rec;
 
 	char *tmpbuffer;
-	unsigned int play_count;
-	unsigned int record_count;
+	uint8_t play_count;
+	uint8_t record_count;
 	bool ports_ready;
 	bool pause;
 };
@@ -94,7 +90,7 @@ static void qubes_jack_connect_ports(struct userdata *u)
 		jack_connect(u->jack_client, src_port, phys_in_ports[c]);
 	}
 	u->play_count = c;
-	
+
 skipplayback:
 	if (*phys_out_ports == NULL) {
 		goto end;
@@ -191,38 +187,29 @@ static int qubes_jack_graph_order_callback(void *arg)
 	return 0;
 }
 
-static float read_nth_float(void *buf, long n)
+static void process_vchan_client_query(struct userdata *u)
 {
-	uint8_t *base = (uint8_t *)buf;
-	union dual {
-		uint32_t u;
-		float f;
-	};
-	union dual v;
-	base += sizeof(float) * n;
-	
-	v.u =	(uint32_t)(base[0] << 24) |
-		(uint32_t)(base[1] << 16) |
-	 	(uint32_t)(base[2] <<  8) |
-		(uint32_t)(base[3] <<  0);
-	return v.f;
-}
+	uint8_t cmd;
+	uint8_t response[QUBES_JACK_CONFIG_QUERY_SIZE];
 
-static void write_nth_float(void *buf, long n, float value)
-{
-	uint8_t *base = (uint8_t *)buf;
-	union dual {
-		uint32_t u;
-		float f;
-	};
-	union dual v;
-	v.f = value;
-	base += sizeof(float) * n;
+	if (libvchan_data_ready(u->control) >= 1) {
+		libvchan_read(u->control, &cmd, 1);
+		if (cmd == QUBES_JACK_CONFIG_QUERY_CMD) {
+			// Prepare the response packet
+			response[0] = QUBES_JACK_CONFIG_QUERY_START;
+			response[1] = u->play_count;
+			response[2] = u->record_count;
+			response[3] = log2_(u->jack_buffer_size);
+			write_nth_u32(response, 1, u->jack_sample_rate);
+			write_nth_u32(response, 2, u->jack_xruns);
+			response[12] = QUBES_JACK_CONFIG_QUERY_END;
 
-	base[0] = (v.u >> 24) & 0xff;
-	base[1] = (v.u >> 16) & 0xff;
-	base[2] = (v.u >>  8) & 0xff;
-	base[3] = (v.u >>  0) & 0xff;
+			// Write response to vchan
+			if (libvchan_buffer_space(u->control) >= QUBES_JACK_CONFIG_QUERY_SIZE) {
+				libvchan_write(u->control, response, QUBES_JACK_CONFIG_QUERY_SIZE);
+			}
+		}
+	}
 }
 
 static int qubes_jack_process(jack_nframes_t nframes, void *arg)
@@ -256,6 +243,8 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	if (!u->ports_ready)
 		return 0;
 
+	process_vchan_client_query(u);
+
 	// get jack output buffers
 	for (i = 0; i < u->play_count; i++)
 		bufs_out[i] = (float*)jack_port_get_buffer(u->output_ports[i], nframes);
@@ -263,7 +252,7 @@ static int qubes_jack_process(jack_nframes_t nframes, void *arg)
 	// get jack input buffers
 	for (i = 0; i < u->record_count; i++)
 		bufs_in[i] = (float*)jack_port_get_buffer(u->input_ports[i], nframes);
-	
+
 	if (u->pause) {
 		// paused, play silence on output
 		for (c = 0; c < u->play_count; c++) {
@@ -342,7 +331,7 @@ static int qubes_jack_init(struct userdata *u)
 		qubes_jack_destroy(u);
 		return -1;
 	}
-		
+
 	const char *jack_client_name = "qubes-vchan-passthru";
 	u->jack_client = jack_client_open(jack_client_name, JackNoStartServer, NULL);
 
@@ -363,6 +352,7 @@ static int qubes_jack_init(struct userdata *u)
 	}
 
 	u->jack_sample_rate = jack_get_sample_rate(u->jack_client);
+	u->jack_buffer_size = jack_get_buffer_size(u->jack_client);
 	u->jack_latency = 16 * 1000 / u->jack_sample_rate;
 
 	return 0;
@@ -378,6 +368,11 @@ static int vchan_conn(struct userdata *u, int domid)
 	u->rec = libvchan_server_init(domid, QUBES_JACK_RECORD_VCHAN_PORT, 128, 8192);
 	if (!u->rec) {
 		fprintf(stderr, "libvchan_server_init rec failed\n");
+		return -1;
+	}
+	u->control = libvchan_server_init(domid, QUBES_JACK_CONFIG_VCHAN_PORT, 1, 1);
+	if (!u->control) {
+		fprintf(stderr, "libvchan_server_init control failed\n");
 		return -1;
 	}
 	return 0;
@@ -413,7 +408,7 @@ int main(int argc, char **argv)
 	if (qubes_jack_init(&u))
 		return 1;
 	fprintf(stderr, "done\n");
-	
+
 	fprintf(stderr, "Get config...");
 	get_jack_play_port_count(&u);
 	get_jack_rec_port_count(&u);
